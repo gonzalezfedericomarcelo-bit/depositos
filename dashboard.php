@@ -4,27 +4,20 @@
 
 require 'db.php';
 
-// Incluimos la estructura visual (que ya tiene la sesión iniciada)
 include 'includes/header.php';
 include 'includes/sidebar.php';
 include 'includes/navbar.php';
 
-// --- LÓGICA: OBTENER DATOS REALES ---
-
-// 1. Contar Insumos Médicos con Stock Bajo o Crítico
+// --- LÓGICA KPI ORIGINAL ---
 $stmtIns = $pdo->query("SELECT COUNT(*) FROM insumos_medicos WHERE stock_actual <= stock_minimo");
 $alerta_insumos = $stmtIns->fetchColumn();
 
-// 2. Contar Suministros con Stock Bajo
 $stmtSum = $pdo->query("SELECT COUNT(*) FROM suministros_generales WHERE stock_actual <= stock_minimo");
 $alerta_suministros = $stmtSum->fetchColumn();
 
-// 3. Contar Órdenes Pendientes de Aprobación (Logística)
 $stmtOC = $pdo->query("SELECT COUNT(*) FROM ordenes_compra WHERE estado = 'pendiente_logistica'");
 $pendientes_oc = $stmtOC->fetchColumn();
 
-// 4. Obtener listado rápido de artículos críticos (Mix de ambos mundos)
-// Usamos UNION para juntar insumos y suministros en una sola tablita de alerta
 $sqlCriticos = "
     (SELECT 'Insumo Médico' as tipo, nombre, stock_actual, stock_minimo FROM insumos_medicos WHERE stock_actual <= stock_minimo)
     UNION
@@ -34,8 +27,94 @@ $sqlCriticos = "
 $stmtCriticos = $pdo->query($sqlCriticos);
 $criticos = $stmtCriticos->fetchAll();
 
-// Roles para personalizar mensaje
 $rol_user = $_SESSION['user_roles'][0] ?? 'Usuario';
+// --- INICIO CÓDIGO NUEVO: LÓGICA DE BANDEJA DE ENTRADA ---
+$tareas_pendientes = [];
+$user_id = $_SESSION['user_id'];
+
+// 1. Obtener mis Roles
+$stmtMisRoles = $pdo->prepare("SELECT id_rol FROM usuario_roles WHERE id_usuario = :uid");
+$stmtMisRoles->execute([':uid' => $user_id]);
+$mis_roles_ids = $stmtMisRoles->fetchAll(PDO::FETCH_COLUMN);
+
+// 2. Si soy Admin, agrego todos para ver todo (Debug)
+if (in_array(1, $mis_roles_ids)) { 
+    $mis_roles_ids = array_merge($mis_roles_ids, [2,3,4,5,6,7,8]); 
+}
+
+// 3. Buscar tareas donde el responsable sea MI ROL
+if (!empty($mis_roles_ids)) {
+    $in  = str_repeat('?,', count($mis_roles_ids) - 1) . '?';
+    // Esta consulta busca pedidos que estén en un paso cuyo responsable sea UNO DE TUS ROLES
+    $sqlTareas = "SELECT p.*, u.nombre_completo, cf.etiqueta_estado, cf.nombre_proceso 
+                  FROM pedidos_servicio p 
+                  JOIN config_flujos cf ON p.paso_actual_id = cf.id 
+                  JOIN usuarios u ON p.id_usuario_solicitante = u.id 
+                  WHERE cf.id_rol_responsable IN ($in) 
+                  AND p.estado NOT IN ('finalizado_proceso', 'rechazado')
+                  ORDER BY p.fecha_solicitud ASC";
+    $stmt = $pdo->prepare($sqlTareas);
+    $stmt->execute($mis_roles_ids);
+    $tareas_pendientes = $stmt->fetchAll();
+}
+
+// 4. Buscar tareas donde el responsable sea YO ESPECÍFICAMENTE (Caso: Confirmación de Servicio)
+$sqlTareasMias = "SELECT p.*, u.nombre_completo, cf.etiqueta_estado, cf.nombre_proceso 
+                  FROM pedidos_servicio p 
+                  JOIN config_flujos cf ON p.paso_actual_id = cf.id 
+                  JOIN usuarios u ON p.id_usuario_solicitante = u.id 
+                  WHERE cf.id_rol_responsable = 0 
+                  AND p.id_usuario_solicitante = :uid
+                  AND p.estado NOT IN ('finalizado_proceso', 'rechazado')";
+$stmtMias = $pdo->prepare($sqlTareasMias);
+$stmtMias->execute([':uid' => $user_id]);
+$mis_confirmaciones = $stmtMias->fetchAll();
+
+$tareas_pendientes = array_merge($tareas_pendientes, $mis_confirmaciones);
+// --- FIN CÓDIGO NUEVO ---
+// --- LÓGICA DE BANDEJA DE ENTRADA (NUEVO BLOQUE) ---
+$tareas_pendientes = [];
+$user_id = $_SESSION['user_id'];
+
+// 1. Obtener mis Roles
+$stmtMisRoles = $pdo->prepare("SELECT id_rol FROM usuario_roles WHERE id_usuario = :uid");
+$stmtMisRoles->execute([':uid' => $user_id]);
+$mis_roles_ids = $stmtMisRoles->fetchAll(PDO::FETCH_COLUMN);
+
+// 2. Si soy Admin, agrego todos para ver todo (Debug)
+if (in_array(1, $mis_roles_ids)) { 
+    $mis_roles_ids = array_merge($mis_roles_ids, [2,3,4,5,6,7,8]); 
+}
+
+// 3. Buscar tareas donde el responsable sea MI ROL
+if (!empty($mis_roles_ids)) {
+    $in  = str_repeat('?,', count($mis_roles_ids) - 1) . '?';
+    $sqlTareas = "SELECT p.*, u.nombre_completo, cf.etiqueta_estado, cf.nombre_proceso 
+                  FROM pedidos_servicio p 
+                  JOIN config_flujos cf ON p.paso_actual_id = cf.id 
+                  JOIN usuarios u ON p.id_usuario_solicitante = u.id 
+                  WHERE cf.id_rol_responsable IN ($in) 
+                  AND p.estado NOT IN ('finalizado_proceso', 'rechazado')
+                  ORDER BY p.fecha_solicitud ASC";
+    $stmt = $pdo->prepare($sqlTareas);
+    $stmt->execute($mis_roles_ids);
+    $tareas_pendientes = $stmt->fetchAll();
+}
+
+// 4. Buscar tareas donde el responsable sea YO ESPECÍFICAMENTE (Caso: Confirmación de Servicio)
+// Cuando id_rol_responsable en config_flujos es 0, significa "El Solicitante"
+$sqlTareasMias = "SELECT p.*, u.nombre_completo, cf.etiqueta_estado, cf.nombre_proceso 
+                  FROM pedidos_servicio p 
+                  JOIN config_flujos cf ON p.paso_actual_id = cf.id 
+                  JOIN usuarios u ON p.id_usuario_solicitante = u.id 
+                  WHERE cf.id_rol_responsable = 0 
+                  AND p.id_usuario_solicitante = :uid
+                  AND p.estado NOT IN ('finalizado_proceso', 'rechazado')";
+$stmtMias = $pdo->prepare($sqlTareasMias);
+$stmtMias->execute([':uid' => $user_id]);
+$mis_confirmaciones = $stmtMias->fetchAll();
+
+$tareas_pendientes = array_merge($tareas_pendientes, $mis_confirmaciones);
 ?>
 
 <div class="container-fluid px-4">
@@ -50,9 +129,101 @@ $rol_user = $_SESSION['user_roles'][0] ?? 'Usuario';
             </span>
         </div>
     </div>
+<?php if (count($tareas_pendientes) > 0): ?>
+    <div class="card mb-4 border-warning shadow-sm">
+        <div class="card-header bg-warning text-dark fw-bold">
+            <i class="fas fa-bell me-2"></i> Bandeja de Entrada: Tienes <?php echo count($tareas_pendientes); ?> tareas pendientes
+        </div>
+        <div class="card-body p-0">
+            <div class="table-responsive">
+                <table class="table table-hover mb-0">
+                    <thead class="table-light">
+                        <tr>
+                            <th>Fecha</th>
+                            <th>Solicitante</th>
+                            <th>Proceso</th>
+                            <th>Estado Actual</th>
+                            <th class="text-center">Acción</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ($tareas_pendientes as $t): ?>
+                            <tr>
+                                <td><?php echo date('d/m H:i', strtotime($t['fecha_solicitud'])); ?></td>
+                                <td>
+                                    <strong><?php echo htmlspecialchars($t['servicio_solicitante']); ?></strong><br>
+                                    <small class="text-muted"><?php echo htmlspecialchars($t['nombre_completo']); ?></small>
+                                </td>
+                                <td>
+                                    <?php 
+                                        $proc = $t['nombre_proceso'];
+                                        $bg = (strpos($proc, 'movimiento') !== false) ? 'bg-info text-dark' : 'bg-success';
+                                        echo "<span class='badge $bg'>".ucfirst(str_replace('_', ' ', $proc))."</span>";
+                                    ?>
+                                </td>
+                                <td><?php echo htmlspecialchars($t['etiqueta_estado']); ?></td>
+                                <td class="text-center">
+                                    <a href="bandeja_gestion_dinamica.php?id=<?php echo $t['id']; ?>" class="btn btn-sm btn-dark fw-bold">
+                                        Gestionar <i class="fas fa-arrow-right ms-1"></i>
+                                    </a>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    <?php endif; ?>
+    
+    <?php if (count($tareas_pendientes) > 0): ?>
+    <div class="card mb-4 border-warning shadow-sm">
+        <div class="card-header bg-warning text-dark fw-bold">
+            <i class="fas fa-bell me-2"></i> Bandeja de Entrada: Tienes <?php echo count($tareas_pendientes); ?> tareas pendientes
+        </div>
+        <div class="card-body p-0">
+            <div class="table-responsive">
+                <table class="table table-hover mb-0">
+                    <thead class="table-light">
+                        <tr>
+                            <th>Fecha</th>
+                            <th>Solicitante</th>
+                            <th>Proceso</th>
+                            <th>Estado Actual</th>
+                            <th class="text-center">Acción</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ($tareas_pendientes as $t): ?>
+                            <tr>
+                                <td><?php echo date('d/m H:i', strtotime($t['fecha_solicitud'])); ?></td>
+                                <td>
+                                    <strong><?php echo htmlspecialchars($t['servicio_solicitante']); ?></strong><br>
+                                    <small class="text-muted"><?php echo htmlspecialchars($t['nombre_completo']); ?></small>
+                                </td>
+                                <td>
+                                    <?php 
+                                        $proc = $t['nombre_proceso'];
+                                        $bg = (strpos($proc, 'movimiento') !== false) ? 'bg-info text-dark' : 'bg-success';
+                                        echo "<span class='badge $bg'>".ucfirst(str_replace('_', ' ', $proc))."</span>";
+                                    ?>
+                                </td>
+                                <td><?php echo htmlspecialchars($t['etiqueta_estado']); ?></td>
+                                <td class="text-center">
+                                    <a href="bandeja_gestion_dinamica.php?id=<?php echo $t['id']; ?>" class="btn btn-sm btn-dark fw-bold">
+                                        Gestionar <i class="fas fa-arrow-right ms-1"></i>
+                                    </a>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    <?php endif; ?>
 
     <div class="row">
-        
         <div class="col-xl-3 col-md-6">
             <div class="card border-start border-4 <?php echo ($alerta_insumos > 0) ? 'border-danger' : 'border-success'; ?> h-100">
                 <div class="card-body">

@@ -1,5 +1,5 @@
 <?php
-// Archivo: index.php (LOGIN REDISEÑADO)
+// Archivo: index.php
 session_start();
 require 'db.php';
 
@@ -13,19 +13,31 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
     if (empty($email) || empty($password)) {
         $error = "Complete los campos.";
     } else {
-        $stmt = $pdo->prepare("SELECT id, nombre_completo, password, activo FROM usuarios WHERE email = :email");
+        // --- CAMBIO: Traemos también el campo validado_por_admin y datos de servicio ---
+        $stmt = $pdo->prepare("SELECT id, nombre_completo, password, activo, validado_por_admin, rol_en_servicio, servicio FROM usuarios WHERE email = :email");
         $stmt->execute(['email' => $email]);
         $user = $stmt->fetch();
 
         if ($user && password_verify($password, $user['password'])) {
             if ($user['activo'] == 0) {
                  $error = "Cuenta desactivada.";
+            } elseif ($user['validado_por_admin'] == 0) {
+                 // --- CAMBIO: Nueva validación ---
+                 $error = "Su cuenta está pendiente de aprobación por la Administración.";
             } else {
                 $_SESSION['user_id'] = $user['id'];
                 $_SESSION['user_name'] = $user['nombre_completo'];
+                
+                // Guardamos datos extras útiles para la lógica de pedidos
+                $_SESSION['user_data'] = [
+                    'rol_en_servicio' => $user['rol_en_servicio'],
+                    'servicio' => $user['servicio']
+                ];
+
                 $stmtRoles = $pdo->prepare("SELECT r.nombre FROM roles r JOIN usuario_roles ur ON r.id = ur.id_rol WHERE ur.id_usuario = :id");
                 $stmtRoles->execute(['id' => $user['id']]);
                 $_SESSION['user_roles'] = $stmtRoles->fetchAll(PDO::FETCH_COLUMN);
+                
                 header("Location: dashboard.php");
                 exit;
             }
@@ -43,6 +55,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
     <title>Acceso - Policlínica ACTIS</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@300;400;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
         body {
             background: linear-gradient(135deg, #0f766e 0%, #115e59 100%);
@@ -110,6 +123,11 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
                 <button type="submit" class="btn btn-primary btn-login">INGRESAR</button>
             </form>
             
+            <div class="mt-4 pt-3 border-top text-center">
+                <p class="small text-muted mb-2">¿Perteneces a un Servicio?</p>
+                <a href="registro.php" class="btn btn-outline-secondary btn-sm w-100 fw-bold">SOLICITAR REGISTRO</a>
+            </div>
+
             <div class="mt-4 text-center">
                 <small class="text-muted">© <?php echo date('Y'); ?> Policlínica ACTIS</small>
             </div>
