@@ -1,399 +1,236 @@
 <?php
 // Archivo: dashboard.php
-// Propósito: Pantalla principal con ALERTAS REALES y KPI (Indicadores Clave)
+// Propósito: Panel de Control Interactivo (Gráficos Clickeables)
 
 require 'db.php';
-
 include 'includes/header.php';
 include 'includes/sidebar.php';
 include 'includes/navbar.php';
 
-// --- LÓGICA KPI ORIGINAL ---
-$stmtIns = $pdo->query("SELECT COUNT(*) FROM insumos_medicos WHERE stock_actual <= stock_minimo");
-$alerta_insumos = $stmtIns->fetchColumn();
-
-$stmtSum = $pdo->query("SELECT COUNT(*) FROM suministros_generales WHERE stock_actual <= stock_minimo");
-$alerta_suministros = $stmtSum->fetchColumn();
-
-$stmtOC = $pdo->query("SELECT COUNT(*) FROM ordenes_compra WHERE estado = 'pendiente_logistica'");
-$pendientes_oc = $stmtOC->fetchColumn();
-
-$sqlCriticos = "
-    (SELECT 'Insumo Médico' as tipo, nombre, stock_actual, stock_minimo FROM insumos_medicos WHERE stock_actual <= stock_minimo)
-    UNION
-    (SELECT 'Suministro' as tipo, nombre, stock_actual, stock_minimo FROM suministros_generales WHERE stock_actual <= stock_minimo)
-    ORDER BY stock_actual ASC LIMIT 5
-";
-$stmtCriticos = $pdo->query($sqlCriticos);
-$criticos = $stmtCriticos->fetchAll();
-
-$rol_user = $_SESSION['user_roles'][0] ?? 'Usuario';
-// --- INICIO CÓDIGO NUEVO: LÓGICA DE BANDEJA DE ENTRADA ---
-$tareas_pendientes = [];
+// 1. CONFIGURACIÓN DE ALCANCE
+$ver_global = tienePermiso('dash_alcance_global');
 $user_id = $_SESSION['user_id'];
+$sql_filtro = $ver_global ? "1=1" : "p.id_usuario_solicitante = $user_id";
 
-// 1. Obtener mis Roles
-$stmtMisRoles = $pdo->prepare("SELECT id_rol FROM usuario_roles WHERE id_usuario = :uid");
-$stmtMisRoles->execute([':uid' => $user_id]);
-$mis_roles_ids = $stmtMisRoles->fetchAll(PDO::FETCH_COLUMN);
-
-// 2. Si soy Admin, agrego todos para ver todo (Debug)
-if (in_array(1, $mis_roles_ids)) { 
-    $mis_roles_ids = array_merge($mis_roles_ids, [2,3,4,5,6,7,8]); 
+// 2. DATOS
+// A. KPIs
+$kpis = ['total'=>0, 'pendientes'=>0, 'aprobados'=>0, 'rechazados'=>0];
+if (tienePermiso('dash_kpis_resumen')) {
+    $sqlKPI = "SELECT 
+                COUNT(*) as total,
+                SUM(CASE WHEN estado LIKE '%pendiente%' OR estado LIKE '%revision%' THEN 1 ELSE 0 END) as pendientes,
+                SUM(CASE WHEN estado LIKE '%aprobado%' OR estado = 'esperando_entrega' THEN 1 ELSE 0 END) as aprobados,
+                SUM(CASE WHEN estado = 'rechazado' THEN 1 ELSE 0 END) as rechazados
+               FROM pedidos_servicio p WHERE $sql_filtro";
+    $kpis = $pdo->query($sqlKPI)->fetch(PDO::FETCH_ASSOC);
 }
 
-// 3. Buscar tareas donde el responsable sea MI ROL
-if (!empty($mis_roles_ids)) {
-    $in  = str_repeat('?,', count($mis_roles_ids) - 1) . '?';
-    // Esta consulta busca pedidos que estén en un paso cuyo responsable sea UNO DE TUS ROLES
-    $sqlTareas = "SELECT p.*, u.nombre_completo, cf.etiqueta_estado, cf.nombre_proceso 
+// B. Gráficos
+$datos_torta = [];
+$datos_barras = [];
+if (tienePermiso('dash_grafico_torta') || tienePermiso('dash_grafico_barras')) {
+    // Torta (Estados)
+    $sqlTorta = "SELECT estado, COUNT(*) as cant FROM pedidos_servicio p WHERE $sql_filtro GROUP BY estado";
+    $datos_torta = $pdo->query($sqlTorta)->fetchAll(PDO::FETCH_KEY_PAIR);
+
+    // Barras (Meses)
+    $sqlBarras = "SELECT DATE_FORMAT(fecha_solicitud, '%Y-%m') as mes, COUNT(*) as cant 
                   FROM pedidos_servicio p 
-                  JOIN config_flujos cf ON p.paso_actual_id = cf.id 
-                  JOIN usuarios u ON p.id_usuario_solicitante = u.id 
-                  WHERE cf.id_rol_responsable IN ($in) 
-                  AND p.estado NOT IN ('finalizado_proceso', 'rechazado')
-                  ORDER BY p.fecha_solicitud ASC";
-    $stmt = $pdo->prepare($sqlTareas);
-    $stmt->execute($mis_roles_ids);
-    $tareas_pendientes = $stmt->fetchAll();
+                  WHERE $sql_filtro AND fecha_solicitud >= DATE_SUB(NOW(), INTERVAL 6 MONTH) 
+                  GROUP BY mes ORDER BY mes ASC";
+    $datos_barras = $pdo->query($sqlBarras)->fetchAll(PDO::FETCH_ASSOC);
 }
 
-// 4. Buscar tareas donde el responsable sea YO ESPECÍFICAMENTE (Caso: Confirmación de Servicio)
-$sqlTareasMias = "SELECT p.*, u.nombre_completo, cf.etiqueta_estado, cf.nombre_proceso 
-                  FROM pedidos_servicio p 
-                  JOIN config_flujos cf ON p.paso_actual_id = cf.id 
-                  JOIN usuarios u ON p.id_usuario_solicitante = u.id 
-                  WHERE cf.id_rol_responsable = 0 
-                  AND p.id_usuario_solicitante = :uid
-                  AND p.estado NOT IN ('finalizado_proceso', 'rechazado')";
-$stmtMias = $pdo->prepare($sqlTareasMias);
-$stmtMias->execute([':uid' => $user_id]);
-$mis_confirmaciones = $stmtMias->fetchAll();
-
-$tareas_pendientes = array_merge($tareas_pendientes, $mis_confirmaciones);
-// --- FIN CÓDIGO NUEVO ---
-// --- LÓGICA DE BANDEJA DE ENTRADA (NUEVO BLOQUE) ---
-$tareas_pendientes = [];
-$user_id = $_SESSION['user_id'];
-
-// 1. Obtener mis Roles
-$stmtMisRoles = $pdo->prepare("SELECT id_rol FROM usuario_roles WHERE id_usuario = :uid");
-$stmtMisRoles->execute([':uid' => $user_id]);
-$mis_roles_ids = $stmtMisRoles->fetchAll(PDO::FETCH_COLUMN);
-
-// 2. Si soy Admin, agrego todos para ver todo (Debug)
-if (in_array(1, $mis_roles_ids)) { 
-    $mis_roles_ids = array_merge($mis_roles_ids, [2,3,4,5,6,7,8]); 
+// C. Recientes
+$recientes = [];
+if (tienePermiso('dash_tabla_recientes')) {
+    $sqlRecientes = "SELECT p.*, u.nombre_completo 
+                     FROM pedidos_servicio p 
+                     JOIN usuarios u ON p.id_usuario_solicitante = u.id 
+                     WHERE $sql_filtro 
+                     ORDER BY p.fecha_solicitud DESC LIMIT 5";
+    $recientes = $pdo->query($sqlRecientes)->fetchAll();
 }
-
-// 3. Buscar tareas donde el responsable sea MI ROL
-if (!empty($mis_roles_ids)) {
-    $in  = str_repeat('?,', count($mis_roles_ids) - 1) . '?';
-    $sqlTareas = "SELECT p.*, u.nombre_completo, cf.etiqueta_estado, cf.nombre_proceso 
-                  FROM pedidos_servicio p 
-                  JOIN config_flujos cf ON p.paso_actual_id = cf.id 
-                  JOIN usuarios u ON p.id_usuario_solicitante = u.id 
-                  WHERE cf.id_rol_responsable IN ($in) 
-                  AND p.estado NOT IN ('finalizado_proceso', 'rechazado')
-                  ORDER BY p.fecha_solicitud ASC";
-    $stmt = $pdo->prepare($sqlTareas);
-    $stmt->execute($mis_roles_ids);
-    $tareas_pendientes = $stmt->fetchAll();
-}
-
-// 4. Buscar tareas donde el responsable sea YO ESPECÍFICAMENTE (Caso: Confirmación de Servicio)
-// Cuando id_rol_responsable en config_flujos es 0, significa "El Solicitante"
-$sqlTareasMias = "SELECT p.*, u.nombre_completo, cf.etiqueta_estado, cf.nombre_proceso 
-                  FROM pedidos_servicio p 
-                  JOIN config_flujos cf ON p.paso_actual_id = cf.id 
-                  JOIN usuarios u ON p.id_usuario_solicitante = u.id 
-                  WHERE cf.id_rol_responsable = 0 
-                  AND p.id_usuario_solicitante = :uid
-                  AND p.estado NOT IN ('finalizado_proceso', 'rechazado')";
-$stmtMias = $pdo->prepare($sqlTareasMias);
-$stmtMias->execute([':uid' => $user_id]);
-$mis_confirmaciones = $stmtMias->fetchAll();
-
-$tareas_pendientes = array_merge($tareas_pendientes, $mis_confirmaciones);
 ?>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
 <div class="container-fluid px-4">
     <div class="d-flex justify-content-between align-items-center mt-4 mb-4">
         <div>
             <h1 class="fw-bold text-primary mb-0">Panel de Control</h1>
-            <p class="text-muted mb-0">Bienvenido de nuevo, <?php echo htmlspecialchars($_SESSION['user_name']); ?></p>
-        </div>
-        <div>
-            <span class="badge bg-light text-dark border p-2">
-                <i class="fas fa-user-shield me-1"></i> <?php echo $rol_user; ?>
-            </span>
+            <p class="text-muted mb-0">
+                Vista: <?php echo $ver_global ? '<span class="badge bg-danger">GLOBAL</span>' : '<span class="badge bg-success">MI SERVICIO</span>'; ?>
+            </p>
         </div>
     </div>
-<?php if (count($tareas_pendientes) > 0): ?>
-    <div class="card mb-4 border-warning shadow-sm">
-        <div class="card-header bg-warning text-dark fw-bold">
-            <i class="fas fa-bell me-2"></i> Bandeja de Entrada: Tienes <?php echo count($tareas_pendientes); ?> tareas pendientes
-        </div>
-        <div class="card-body p-0">
-            <div class="table-responsive">
-                <table class="table table-hover mb-0">
-                    <thead class="table-light">
-                        <tr>
-                            <th>Fecha</th>
-                            <th>Solicitante</th>
-                            <th>Proceso</th>
-                            <th>Estado Actual</th>
-                            <th class="text-center">Acción</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <?php foreach ($tareas_pendientes as $t): ?>
-                            <tr>
-                                <td><?php echo date('d/m H:i', strtotime($t['fecha_solicitud'])); ?></td>
-                                <td>
-                                    <strong><?php echo htmlspecialchars($t['servicio_solicitante']); ?></strong><br>
-                                    <small class="text-muted"><?php echo htmlspecialchars($t['nombre_completo']); ?></small>
-                                </td>
-                                <td>
-                                    <?php 
-                                        $proc = $t['nombre_proceso'];
-                                        $bg = (strpos($proc, 'movimiento') !== false) ? 'bg-info text-dark' : 'bg-success';
-                                        echo "<span class='badge $bg'>".ucfirst(str_replace('_', ' ', $proc))."</span>";
-                                    ?>
-                                </td>
-                                <td><?php echo htmlspecialchars($t['etiqueta_estado']); ?></td>
-                                <td class="text-center">
-                                    <a href="bandeja_gestion_dinamica.php?id=<?php echo $t['id']; ?>" class="btn btn-sm btn-dark fw-bold">
-                                        Gestionar <i class="fas fa-arrow-right ms-1"></i>
-                                    </a>
-                                </td>
-                            </tr>
-                        <?php endforeach; ?>
-                    </tbody>
-                </table>
+
+    <?php if (tienePermiso('dash_kpis_resumen')): ?>
+    <div class="row g-3 mb-4">
+        <div class="col-xl-3 col-md-6">
+            <div class="card bg-primary text-white h-100 shadow-sm border-0 clickable-card" onclick="window.location='historial_pedidos.php'">
+                <div class="card-body d-flex justify-content-between align-items-center">
+                    <div><div class="text-white-50 small fw-bold">TOTAL</div><div class="display-6 fw-bold"><?php echo $kpis['total']; ?></div></div>
+                    <i class="fas fa-folder-open fa-3x text-white-50"></i>
+                </div>
             </div>
         </div>
-    </div>
-    <?php endif; ?>
-    
-    <?php if (count($tareas_pendientes) > 0): ?>
-    <div class="card mb-4 border-warning shadow-sm">
-        <div class="card-header bg-warning text-dark fw-bold">
-            <i class="fas fa-bell me-2"></i> Bandeja de Entrada: Tienes <?php echo count($tareas_pendientes); ?> tareas pendientes
+        <div class="col-xl-3 col-md-6">
+            <div class="card bg-warning text-dark h-100 shadow-sm border-0 clickable-card" onclick="window.location='historial_pedidos.php?estado=pendiente'">
+                <div class="card-body d-flex justify-content-between align-items-center">
+                    <div><div class="text-dark-50 small fw-bold">EN PROCESO</div><div class="display-6 fw-bold"><?php echo $kpis['pendientes']; ?></div></div>
+                    <i class="fas fa-clock fa-3x text-dark-50 opacity-50"></i>
+                </div>
+            </div>
         </div>
-        <div class="card-body p-0">
-            <div class="table-responsive">
-                <table class="table table-hover mb-0">
-                    <thead class="table-light">
-                        <tr>
-                            <th>Fecha</th>
-                            <th>Solicitante</th>
-                            <th>Proceso</th>
-                            <th>Estado Actual</th>
-                            <th class="text-center">Acción</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <?php foreach ($tareas_pendientes as $t): ?>
-                            <tr>
-                                <td><?php echo date('d/m H:i', strtotime($t['fecha_solicitud'])); ?></td>
-                                <td>
-                                    <strong><?php echo htmlspecialchars($t['servicio_solicitante']); ?></strong><br>
-                                    <small class="text-muted"><?php echo htmlspecialchars($t['nombre_completo']); ?></small>
-                                </td>
-                                <td>
-                                    <?php 
-                                        $proc = $t['nombre_proceso'];
-                                        $bg = (strpos($proc, 'movimiento') !== false) ? 'bg-info text-dark' : 'bg-success';
-                                        echo "<span class='badge $bg'>".ucfirst(str_replace('_', ' ', $proc))."</span>";
-                                    ?>
-                                </td>
-                                <td><?php echo htmlspecialchars($t['etiqueta_estado']); ?></td>
-                                <td class="text-center">
-                                    <a href="bandeja_gestion_dinamica.php?id=<?php echo $t['id']; ?>" class="btn btn-sm btn-dark fw-bold">
-                                        Gestionar <i class="fas fa-arrow-right ms-1"></i>
-                                    </a>
-                                </td>
-                            </tr>
-                        <?php endforeach; ?>
-                    </tbody>
-                </table>
+        <div class="col-xl-3 col-md-6">
+            <div class="card bg-success text-white h-100 shadow-sm border-0 clickable-card" onclick="window.location='historial_pedidos.php?estado=aprobado'">
+                <div class="card-body d-flex justify-content-between align-items-center">
+                    <div><div class="text-white-50 small fw-bold">APROBADOS</div><div class="display-6 fw-bold"><?php echo $kpis['aprobados']; ?></div></div>
+                    <i class="fas fa-check-circle fa-3x text-white-50"></i>
+                </div>
+            </div>
+        </div>
+        <div class="col-xl-3 col-md-6">
+            <div class="card bg-danger text-white h-100 shadow-sm border-0 clickable-card" onclick="window.location='historial_pedidos.php?estado=rechazado'">
+                <div class="card-body d-flex justify-content-between align-items-center">
+                    <div><div class="text-white-50 small fw-bold">RECHAZADOS</div><div class="display-6 fw-bold"><?php echo $kpis['rechazados']; ?></div></div>
+                    <i class="fas fa-times-circle fa-3x text-white-50"></i>
+                </div>
             </div>
         </div>
     </div>
     <?php endif; ?>
 
-    <div class="row">
-        <div class="col-xl-3 col-md-6">
-            <div class="card border-start border-4 <?php echo ($alerta_insumos > 0) ? 'border-danger' : 'border-success'; ?> h-100">
-                <div class="card-body">
-                    <div class="d-flex justify-content-between align-items-center">
-                        <div>
-                            <div class="text-uppercase small fw-bold <?php echo ($alerta_insumos > 0) ? 'text-danger' : 'text-success'; ?> mb-1">
-                                Insumos (Stock Bajo)
-                            </div>
-                            <div class="h3 mb-0 fw-bold text-dark"><?php echo $alerta_insumos; ?></div>
-                        </div>
-                        <div class="fs-1 <?php echo ($alerta_insumos > 0) ? 'text-danger opacity-25' : 'text-success opacity-25'; ?>">
-                            <i class="fas fa-briefcase-medical"></i>
-                        </div>
-                    </div>
-                </div>
-                <div class="card-footer d-flex align-items-center justify-content-between small">
-                    <a class="text-decoration-none stretched-link <?php echo ($alerta_insumos > 0) ? 'text-danger fw-bold' : 'text-muted'; ?>" href="insumos_stock.php">
-                        Ver Inventario
-                    </a>
-                    <i class="fas fa-angle-right"></i>
-                </div>
-            </div>
-        </div>
-
-        <div class="col-xl-3 col-md-6">
-            <div class="card border-start border-4 <?php echo ($alerta_suministros > 0) ? 'border-danger' : 'border-success'; ?> h-100">
-                <div class="card-body">
-                    <div class="d-flex justify-content-between align-items-center">
-                        <div>
-                            <div class="text-uppercase small fw-bold <?php echo ($alerta_suministros > 0) ? 'text-danger' : 'text-success'; ?> mb-1">
-                                Suministros (Bajo)
-                            </div>
-                            <div class="h3 mb-0 fw-bold text-dark"><?php echo $alerta_suministros; ?></div>
-                        </div>
-                        <div class="fs-1 <?php echo ($alerta_suministros > 0) ? 'text-danger opacity-25' : 'text-success opacity-25'; ?>">
-                            <i class="fas fa-boxes"></i>
-                        </div>
-                    </div>
-                </div>
-                <div class="card-footer d-flex align-items-center justify-content-between small">
-                    <a class="text-decoration-none stretched-link <?php echo ($alerta_suministros > 0) ? 'text-danger fw-bold' : 'text-muted'; ?>" href="suministros_stock.php">
-                        Ver Inventario
-                    </a>
-                    <i class="fas fa-angle-right"></i>
-                </div>
-            </div>
-        </div>
-
-        <div class="col-xl-3 col-md-6">
-            <div class="card border-start border-4 <?php echo ($pendientes_oc > 0) ? 'border-warning' : 'border-primary'; ?> h-100">
-                <div class="card-body">
-                    <div class="d-flex justify-content-between align-items-center">
-                        <div>
-                            <div class="text-uppercase small fw-bold <?php echo ($pendientes_oc > 0) ? 'text-warning' : 'text-primary'; ?> mb-1">
-                                Compras Pendientes
-                            </div>
-                            <div class="h3 mb-0 fw-bold text-dark"><?php echo $pendientes_oc; ?></div>
-                        </div>
-                        <div class="fs-1 text-warning opacity-25">
-                            <i class="fas fa-clipboard-check"></i>
-                        </div>
-                    </div>
-                </div>
-                <div class="card-footer d-flex align-items-center justify-content-between small">
-                    <a class="text-decoration-none stretched-link text-muted" href="insumos_compras.php">Revisar Órdenes</a>
-                    <i class="fas fa-angle-right"></i>
-                </div>
-            </div>
-        </div>
-
-        <div class="col-xl-3 col-md-6">
-            <div class="card border-start border-4 border-info h-100">
-                <div class="card-body">
-                    <div class="d-flex justify-content-between align-items-center">
-                        <div>
-                            <div class="text-uppercase small fw-bold text-info mb-1">Nueva Salida</div>
-                            <div class="small text-muted">Registrar Entrega</div>
-                        </div>
-                        <div class="fs-1 text-info opacity-25">
-                            <i class="fas fa-truck-loading"></i>
-                        </div>
-                    </div>
-                </div>
-                <div class="card-footer d-flex align-items-center justify-content-between small">
-                    <a class="text-decoration-none stretched-link text-info fw-bold" href="insumos_entregas.php">Ir a Entregas</a>
-                    <i class="fas fa-angle-right"></i>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <div class="row mt-4">
+    <div class="row mb-4">
+        <?php if (tienePermiso('dash_grafico_barras')): ?>
         <div class="col-lg-8">
-            <div class="card mb-4">
-                <div class="card-header bg-white">
-                    <i class="fas fa-exclamation-circle text-danger me-1"></i> 
-                    <strong>Reposición Urgente</strong> (Top 5 Críticos)
-                </div>
-                <div class="card-body p-0">
-                    <div class="table-responsive">
-                        <table class="table table-hover mb-0">
-                            <thead class="table-light">
-                                <tr>
-                                    <th>Tipo</th>
-                                    <th>Producto</th>
-                                    <th class="text-center">Stock Real</th>
-                                    <th class="text-center">Mínimo</th>
-                                    <th>Estado</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                <?php if (count($criticos) > 0): ?>
-                                    <?php foreach ($criticos as $c): ?>
-                                        <tr>
-                                            <td>
-                                                <?php if($c['tipo'] == 'Insumo Médico'): ?>
-                                                    <span class="badge bg-primary bg-opacity-10 text-primary">Insumo</span>
-                                                <?php else: ?>
-                                                    <span class="badge bg-success bg-opacity-10 text-success">Suministro</span>
-                                                <?php endif; ?>
-                                            </td>
-                                            <td class="fw-500"><?php echo htmlspecialchars($c['nombre']); ?></td>
-                                            <td class="text-center fw-bold text-danger"><?php echo $c['stock_actual']; ?></td>
-                                            <td class="text-center text-muted"><?php echo $c['stock_minimo']; ?></td>
-                                            <td><span class="badge bg-danger">Crítico</span></td>
-                                        </tr>
-                                    <?php endforeach; ?>
-                                <?php else: ?>
-                                    <tr>
-                                        <td colspan="5" class="text-center py-4 text-success">
-                                            <i class="fas fa-check-circle fa-2x mb-2"></i><br>
-                                            ¡Todo en orden! No hay alertas de stock.
-                                        </td>
-                                    </tr>
-                                <?php endif; ?>
-                            </tbody>
-                        </table>
-                    </div>
+            <div class="card shadow-sm h-100">
+                <div class="card-header bg-white fw-bold">Evolución Mensual (Clickeable)</div>
+                <div class="card-body">
+                    <canvas id="chartBarras" height="100"></canvas>
                 </div>
             </div>
         </div>
+        <?php endif; ?>
 
+        <?php if (tienePermiso('dash_grafico_torta')): ?>
         <div class="col-lg-4">
-            <div class="card mb-4">
-                <div class="card-header bg-white">
-                    <i class="fas fa-bolt text-warning me-1"></i> Acciones Rápidas
-                </div>
-                <div class="list-group list-group-flush">
-                    <a href="insumos_stock.php" class="list-group-item list-group-item-action d-flex justify-content-between align-items-center">
-                        <div><i class="fas fa-search me-2 text-muted"></i> Consultar Stock Médico</div>
-                        <i class="fas fa-chevron-right small text-muted"></i>
-                    </a>
-                    <a href="suministros_oc_crear.php" class="list-group-item list-group-item-action d-flex justify-content-between align-items-center">
-                        <div><i class="fas fa-cart-plus me-2 text-muted"></i> Comprar Suministros</div>
-                        <i class="fas fa-chevron-right small text-muted"></i>
-                    </a>
-                    <a href="perfil.php" class="list-group-item list-group-item-action d-flex justify-content-between align-items-center">
-                        <div><i class="fas fa-signature me-2 text-muted"></i> Actualizar mi Firma</div>
-                        <i class="fas fa-chevron-right small text-muted"></i>
-                    </a>
-                    <?php if ($rol_user == 'Administrador'): ?>
-                    <a href="admin_usuarios.php" class="list-group-item list-group-item-action d-flex justify-content-between align-items-center bg-light">
-                        <div class="text-primary"><i class="fas fa-users-cog me-2"></i> Gestión Usuarios</div>
-                        <i class="fas fa-chevron-right small text-primary"></i>
-                    </a>
-                    <?php endif; ?>
+            <div class="card shadow-sm h-100">
+                <div class="card-header bg-white fw-bold">Estado Actual (Clickeable)</div>
+                <div class="card-body">
+                    <canvas id="chartTorta" height="200"></canvas>
                 </div>
             </div>
+        </div>
+        <?php endif; ?>
+    </div>
+
+    <?php if (tienePermiso('dash_tabla_recientes')): ?>
+    <div class="card shadow-sm mb-4">
+        <div class="card-header bg-white d-flex justify-content-between align-items-center">
+            <span class="fw-bold">Últimos Movimientos</span>
+            <a href="historial_pedidos.php" class="btn btn-sm btn-light text-primary fw-bold">Ver Historial Completo</a>
+        </div>
+        <div class="table-responsive">
+            <table class="table table-hover align-middle mb-0">
+                <thead class="table-light small">
+                    <tr><th>ID</th><th>Fecha</th><th>Solicitante</th><th>Estado</th><th class="text-end"></th></tr>
+                </thead>
+                <tbody>
+                    <?php if(count($recientes)>0): ?>
+                        <?php foreach($recientes as $r): ?>
+                        <tr class="clickable-row" onclick="window.location='bandeja_gestion_dinamica.php?id=<?php echo $r['id']; ?>'" style="cursor: pointer;">
+                            <td><span class="badge bg-light text-dark border">#<?php echo $r['id']; ?></span></td>
+                            <td><?php echo date('d/m H:i', strtotime($r['fecha_solicitud'])); ?></td>
+                            <td><?php echo htmlspecialchars($r['nombre_completo']); ?></td>
+                            <td><span class="badge bg-secondary"><?php echo $r['estado']; ?></span></td>
+                            <td class="text-end"><i class="fas fa-chevron-right text-muted small"></i></td>
+                        </tr>
+                        <?php endforeach; ?>
+                    <?php else: ?>
+                        <tr><td colspan="5" class="text-center text-muted py-3">Sin movimientos.</td></tr>
+                    <?php endif; ?>
+                </tbody>
+            </table>
         </div>
     </div>
+    <?php endif; ?>
 </div>
 
+<style>
+    .clickable-card { cursor: pointer; transition: transform 0.2s; }
+    .clickable-card:hover { transform: translateY(-5px); }
+    .clickable-row:hover { background-color: #f8f9fa; }
+</style>
+
+<script>
+// --- DATOS PHP A JS ---
+const dataTorta = <?php echo json_encode($datos_torta); ?>;
+const dataBarras = <?php echo json_encode($datos_barras); ?>;
+
+// --- CONFIGURACIÓN DE GRÁFICOS ---
+
+// 1. TORTA
+if (document.getElementById('chartTorta')) {
+    const ctxTorta = document.getElementById('chartTorta').getContext('2d');
+    new Chart(ctxTorta, {
+        type: 'doughnut',
+        data: {
+            labels: Object.keys(dataTorta).map(s => s.toUpperCase().replace(/_/g, ' ')),
+            datasets: [{
+                data: Object.values(dataTorta),
+                backgroundColor: ['#ffc107', '#198754', '#0dcaf0', '#dc3545', '#6c757d'],
+                borderWidth: 1
+            }]
+        },
+        options: {
+            responsive: true,
+            onHover: (event, chartElement) => {
+                event.native.target.style.cursor = chartElement[0] ? 'pointer' : 'default';
+            },
+            onClick: (event, elements) => {
+                if (elements.length > 0) {
+                    // Obtener etiqueta clicada (ej: 'PENDIENTE')
+                    const index = elements[0].index;
+                    const label = Object.keys(dataTorta)[index]; // Clave original (ej: 'pendiente_logistica')
+                    // Redirigir al historial filtrado
+                    window.location.href = `historial_pedidos.php?estado=${label}`;
+                }
+            }
+        }
+    });
+}
+
+// 2. BARRAS
+if (document.getElementById('chartBarras')) {
+    const ctxBarras = document.getElementById('chartBarras').getContext('2d');
+    new Chart(ctxBarras, {
+        type: 'bar',
+        data: {
+            labels: dataBarras.map(d => d.mes),
+            datasets: [{
+                label: 'Pedidos',
+                data: dataBarras.map(d => d.cant),
+                backgroundColor: '#0d6efd',
+                borderRadius: 4
+            }]
+        },
+        options: {
+            responsive: true,
+            scales: { y: { beginAtZero: true } },
+            onHover: (event, chartElement) => {
+                event.native.target.style.cursor = chartElement[0] ? 'pointer' : 'default';
+            },
+            onClick: (event, elements) => {
+                if (elements.length > 0) {
+                    const index = elements[0].index;
+                    const mes = dataBarras[index].mes; // '2025-12'
+                    window.location.href = `historial_pedidos.php?mes=${mes}`;
+                }
+            }
+        }
+    });
+}
+</script>
 <?php include 'includes/footer.php'; ?>

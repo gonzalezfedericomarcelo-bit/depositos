@@ -1,30 +1,35 @@
 <?php
 // Archivo: pedidos_adquisicion_suministros.php
-// Propósito: Planificación de Compras Suministros -> Encargado -> Dir. Operativo -> Compras
+// Propósito: Solicitud de Compra de Suministros Generales
+
 require 'db.php';
 include 'includes/header.php';
 include 'includes/sidebar.php';
 include 'includes/navbar.php';
 
-// Validar Responsable
-if (($_SESSION['user_data']['rol_en_servicio'] ?? '') != 'Responsable') {
-    die("<div class='alert alert-danger m-4'>Acceso denegado. Solo Responsables.</div>");
+// --- NUEVA VALIDACIÓN POR PERMISO ---
+if (!tienePermiso('hacer_compra_suministros')) {
+    echo "<div class='container-fluid px-4 mt-4'><div class='alert alert-danger shadow-sm'>
+            <h4 class='alert-heading'><i class='fas fa-lock'></i> Acceso Restringido</h4>
+            <p>No tienes permiso para solicitar compras de <strong>Suministros Generales</strong>.</p>
+          </div></div>";
+    include 'includes/footer.php';
+    exit;
 }
+// ------------------------------------
 
 if ($_SERVER["REQUEST_METHOD"] == "POST") {
     try {
         $pdo->beginTransaction();
 
-        // 1. Buscar primer paso de 'adquisicion_suministros'
         $stmtFlujo = $pdo->prepare("SELECT * FROM config_flujos WHERE nombre_proceso = 'adquisicion_suministros' ORDER BY paso_orden ASC LIMIT 1");
         $stmtFlujo->execute();
         $primerPaso = $stmtFlujo->fetch();
 
         if (!$primerPaso) throw new Exception("Error: Flujo de Adquisición Suministros no configurado.");
 
-        // 2. Insertar Cabecera
-        $sql = "INSERT INTO pedidos_servicio (tipo_insumo, proceso_origen, id_usuario_solicitante, servicio_solicitante, estado, prioridad, frecuencia_compra, paso_actual_id) 
-                VALUES ('suministros', 'adquisicion_suministros', :uid, :serv, :estado, :prio, :freq, :paso_id)";
+        $sql = "INSERT INTO pedidos_servicio (tipo_insumo, id_usuario_solicitante, servicio_solicitante, estado, prioridad, frecuencia_compra, paso_actual_id, proceso_origen) 
+                VALUES ('suministros', :uid, :serv, :estado, :prio, :freq, :paso_id, 'adquisicion_suministros')";
         
         $stmt = $pdo->prepare($sql);
         $stmt->execute([
@@ -37,7 +42,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
         ]);
         $id_pedido = $pdo->lastInsertId();
 
-        // 3. Insertar Ítems
         if (isset($_POST['suministro_id'])) {
             $stmtItem = $pdo->prepare("INSERT INTO pedidos_items (id_pedido, id_suministro, cantidad_solicitada) VALUES (:idp, :ids, :cant)");
             for ($i = 0; $i < count($_POST['suministro_id']); $i++) {
@@ -51,7 +55,6 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
             }
         }
 
-        // 4. Notificar al Encargado de Suministros
         $pdo->prepare("INSERT INTO notificaciones (id_rol_destino, mensaje, url_destino) VALUES (?, ?, ?)")
             ->execute([$primerPaso['id_rol_responsable'], "Nueva Planificación de Compra: " . $_SESSION['user_data']['servicio'], "bandeja_gestion_dinamica.php?id=" . $id_pedido]);
 
@@ -69,19 +72,16 @@ $suministros = $pdo->query("SELECT * FROM suministros_generales WHERE stock_actu
 
 <div class="container-fluid px-4">
     <h1 class="mt-4">Planificación de Adquisición (Suministros)</h1>
-    <div class="alert alert-warning">
-        <i class="fas fa-calendar-alt"></i> Use este formulario para solicitar stock periódico (Ej: Resmas para todo el año). Para urgencias diarias, use "Solicitud Interna".
-    </div>
     
     <form method="POST" id="formAdquisicion">
         <div class="card mb-4 shadow-sm">
-            <div class="card-header bg-success text-white fw-bold">1. Datos de la Planificación</div>
+            <div class="card-header bg-success text-white fw-bold">1. Datos Generales</div>
             <div class="card-body">
                 <div class="mb-3">
                     <label class="fw-bold d-block">Tipo de Pedido:</label>
                     <div class="form-check form-check-inline">
                         <input class="form-check-input" type="radio" name="prioridad" id="prioNormal" value="Normal" checked onchange="toggleFrecuencia()">
-                        <label class="form-check-label" for="prioNormal">Normal (Planificado)</label>
+                        <label class="form-check-label" for="prioNormal">Normal</label>
                     </div>
                     <div class="form-check form-check-inline">
                         <input class="form-check-input" type="radio" name="prioridad" id="prioExtra" value="Extraordinaria" onchange="toggleFrecuencia()">
@@ -90,7 +90,7 @@ $suministros = $pdo->query("SELECT * FROM suministros_generales WHERE stock_actu
                 </div>
 
                 <div class="mb-3" id="divFrecuencia">
-                    <label class="fw-bold">Cobertura Temporal (¿Para cuánto tiempo es este pedido?):</label>
+                    <label class="fw-bold">Cobertura Temporal:</label>
                     <select name="frecuencia" class="form-select w-50">
                         <option value="Trimestral">Trimestral (3 meses)</option>
                         <option value="Semestral">Semestral (6 meses)</option>

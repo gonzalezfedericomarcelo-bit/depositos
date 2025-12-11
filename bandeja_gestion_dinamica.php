@@ -1,6 +1,6 @@
 <?php
 // Archivo: bandeja_gestion_dinamica.php
-// Propósito: Motor único que gestiona CUALQUIER paso de CUALQUIER flujo (Con carga de OC y notificaciones masivas)
+// Propósito: Motor único que gestiona CUALQUIER paso de CUALQUIER flujo (CORREGIDO ERROR ROL 0)
 require 'db.php';
 session_start();
 include 'includes/header.php';
@@ -24,16 +24,23 @@ if (!$pedido) die("<div class='alert alert-danger m-4'>Error: El pedido no tiene
 
 // 2. Verificar Permisos
 $puede_gestionar = false;
-$stmtCheckRol = $pdo->prepare("SELECT * FROM usuario_roles WHERE id_usuario = :uid AND id_rol = :rid");
-$stmtCheckRol->execute([':uid'=>$user_id, ':rid'=>$pedido['id_rol_responsable']]);
-if ($stmtCheckRol->fetch() || in_array('Administrador', $roles_usuario)) {
-    $puede_gestionar = true;
+
+// Si el responsable es 0, significa que el responsable es EL DUEÑO DEL PEDIDO
+if ($pedido['id_rol_responsable'] == 0) {
+    if ($pedido['id_usuario_solicitante'] == $user_id) {
+        $puede_gestionar = true;
+    }
+} else {
+    // Si es un rol normal, chequeamos si tengo ese rol
+    $stmtCheckRol = $pdo->prepare("SELECT * FROM usuario_roles WHERE id_usuario = :uid AND id_rol = :rid");
+    $stmtCheckRol->execute([':uid'=>$user_id, ':rid'=>$pedido['id_rol_responsable']]);
+    if ($stmtCheckRol->fetch() || in_array('Administrador', $roles_usuario)) {
+        $puede_gestionar = true;
+    }
 }
 
 // Verificar si es el PASO FINAL DE ADQUISICIÓN (Compras)
-// (Para mostrar el input de archivo)
 $es_fin_adquisicion = false;
-// Chequeamos si hay un paso siguiente
 $stmtNextCheck = $pdo->prepare("SELECT id FROM config_flujos WHERE nombre_proceso = :proc AND paso_orden > :ord");
 $stmtNextCheck->execute([':proc'=>$pedido['nombre_proceso'], ':ord'=>$pedido['paso_orden']]);
 if ($stmtNextCheck->rowCount() == 0 && strpos($pedido['nombre_proceso'], 'adquisicion') !== false) {
@@ -62,16 +69,25 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && $puede_gestionar) {
             $sqlUpd = "UPDATE pedidos_servicio SET estado = :est, paso_actual_id = :pid WHERE id = :id";
             $pdo->prepare($sqlUpd)->execute([':est'=>$siguiente['nombre_estado'], ':pid'=>$siguiente['id'], ':id'=>$id_pedido]);
             
-            // Notificar al siguiente responsable
+            // --- CORRECCIÓN CRÍTICA DE NOTIFICACIONES ---
             $msj = "Solicitud #$id_pedido requiere tu revisión (" . $siguiente['etiqueta_estado'] . ")";
-            $pdo->prepare("INSERT INTO notificaciones (id_rol_destino, mensaje, url_destino) VALUES (?,?,?)")
-                ->execute([$siguiente['id_rol_responsable'], $msj, "bandeja_gestion_dinamica.php?id=$id_pedido"]);
+            
+            if ($siguiente['id_rol_responsable'] == 0) {
+                // Si el siguiente responsable es 0, ES EL SOLICITANTE (Usuario específico)
+                $pdo->prepare("INSERT INTO notificaciones (id_usuario_destino, mensaje, url_destino) VALUES (?,?,?)")
+                    ->execute([$pedido['id_usuario_solicitante'], $msj, "bandeja_gestion_dinamica.php?id=$id_pedido"]);
+            } else {
+                // Si es un número > 0, es un ROL
+                $pdo->prepare("INSERT INTO notificaciones (id_rol_destino, mensaje, url_destino) VALUES (?,?,?)")
+                    ->execute([$siguiente['id_rol_responsable'], $msj, "bandeja_gestion_dinamica.php?id=$id_pedido"]);
+            }
+            // --------------------------------------------
             
             // Caso especial: Si vuelve del Director al Encargado (en movimientos)
             if ($pedido['nombre_estado'] == 'aprobacion_director' && $pedido['nombre_proceso'] == 'movimiento_insumos') {
-                $rolEncargado = 4; 
-                $pdo->prepare("INSERT INTO notificaciones (id_rol_destino, mensaje, url_destino) VALUES (?,?,?)")
-                    ->execute([$rolEncargado, "El Director aprobó el pedido #$id_pedido. Vuelve a ti.", "bandeja_gestion_dinamica.php?id=$id_pedido"]);
+                // Buscamos dinámicamente el rol de encargado de insumos (ID 4 usualmente)
+                $pdo->prepare("INSERT INTO notificaciones (id_rol_destino, mensaje, url_destino) VALUES (4,?,?)")
+                    ->execute(["El Director aprobó el pedido #$id_pedido. Vuelve a ti.", "bandeja_gestion_dinamica.php?id=$id_pedido"]);
             }
             
             $msg_final = "Aprobado. El expediente avanzó a: " . $siguiente['etiqueta_estado'];
@@ -80,14 +96,15 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && $puede_gestionar) {
             // ---> NO HAY PASO SIGUIENTE (FIN DEL PROCESO)
             
             if ($pedido['nombre_proceso'] == 'movimiento_insumos' || $pedido['nombre_proceso'] == 'movimiento_suministros') {
-                // ... (Lógica de Movimiento Interno - Igual que antes) ...
-                $sqlUpd = "UPDATE pedidos_servicio SET estado = 'listo_para_retirar', paso_actual_id = NULL WHERE id = :id";
+                // Lógica de Movimiento Interno
+                $sqlUpd = "UPDATE pedidos_servicio SET estado = 'finalizado_proceso', paso_actual_id = NULL, fecha_entrega_real = NOW() WHERE id = :id";
                 $pdo->prepare($sqlUpd)->execute([':id'=>$id_pedido]);
                 
+                // Si llegamos al final de un movimiento, notificamos al solicitante que ya terminó
                 $pdo->prepare("INSERT INTO notificaciones (id_usuario_destino, mensaje, url_destino) VALUES (?,?,?)")
-                    ->execute([$pedido['id_usuario_solicitante'], "✅ Tus insumos (Pedido #$id_pedido) están LISTOS PARA RETIRAR.", "dashboard.php"]);
+                    ->execute([$pedido['id_usuario_solicitante'], "✅ Proceso Finalizado (Pedido #$id_pedido).", "historial_pedidos.php"]);
                 
-                $msg_final = "Proceso finalizado. Se notificó al servicio para retirar.";
+                $msg_final = "Proceso finalizado correctamente.";
                 
             } else {
                 // ---> FINAL DE ADQUISICIÓN (COMPRAS) <---
@@ -116,35 +133,29 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && $puede_gestionar) {
                     ':nom' => $_FILES['orden_compra']['name']
                 ]);
 
-                // 4. Actualizar Estado a 'esperando_entrega' y limpiar paso_actual (para que desaparezca de la bandeja)
+                // 4. Actualizar Estado
                 $sqlUpd = "UPDATE pedidos_servicio SET estado = 'esperando_entrega', paso_actual_id = NULL WHERE id = :id";
                 $pdo->prepare($sqlUpd)->execute([':id'=>$id_pedido]);
 
-                // 5. NOTIFICACIÓN MASIVA (A todos los involucrados)
+                // 5. NOTIFICACIÓN MASIVA
                 $mensaje_notificacion = "📢 OC Generada para Pedido #$id_pedido. En espera de proveedor.";
                 
                 // A. Solicitante
                 $pdo->prepare("INSERT INTO notificaciones (id_usuario_destino, mensaje, url_destino) VALUES (?,?,?)")
                     ->execute([$pedido['id_usuario_solicitante'], $mensaje_notificacion, "dashboard.php"]);
 
-                // B. Director Médico (Si intervino)
+                // B. Director Médico/Operativo
                 if ($pedido['id_director_aprobador']) {
                     $pdo->prepare("INSERT INTO notificaciones (id_usuario_destino, mensaje) VALUES (?,?)")
                         ->execute([$pedido['id_director_aprobador'], $mensaje_notificacion]);
                 }
 
-                // C. Logística (Si intervino)
-                if ($pedido['id_logistica_aprobador']) {
-                    $pdo->prepare("INSERT INTO notificaciones (id_usuario_destino, mensaje) VALUES (?,?)")
-                        ->execute([$pedido['id_logistica_aprobador'], $mensaje_notificacion]);
-                }
-                
-                // D. Encargado de Insumos/Suministros (Roles 4 y 5) - Avisamos a los roles directamente
+                // D. Encargado de Insumos/Suministros
                 $rolEncargado = ($pedido['tipo_insumo'] == 'insumos_medicos') ? 4 : 5;
                 $pdo->prepare("INSERT INTO notificaciones (id_rol_destino, mensaje) VALUES (?,?)")
                     ->execute([$rolEncargado, $mensaje_notificacion]);
 
-                $msg_final = "Orden de Compra adjuntada y proceso notificado a todos los involucrados.";
+                $msg_final = "Orden de Compra adjuntada y proceso notificado.";
             }
         }
         
@@ -157,12 +168,16 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && $puede_gestionar) {
     }
 }
 
-$items = $pdo->query("SELECT pi.*, im.nombre FROM pedidos_items pi JOIN insumos_medicos im ON pi.id_insumo = im.id WHERE pi.id_pedido = $id_pedido")->fetchAll();
+$items = $pdo->query("SELECT pi.*, COALESCE(im.nombre, sg.nombre) as nombre 
+                      FROM pedidos_items pi 
+                      LEFT JOIN insumos_medicos im ON pi.id_insumo = im.id 
+                      LEFT JOIN suministros_generales sg ON pi.id_suministro = sg.id 
+                      WHERE pi.id_pedido = $id_pedido")->fetchAll();
 ?>
 
 <div class="container-fluid px-4">
     <div class="d-flex justify-content-between align-items-center mt-4 mb-4">
-        <h2>Gestión Dinámica: <?php echo $pedido['etiqueta_estado']; ?></h2>
+        <h2>Gestión Dinámica: <?php echo htmlspecialchars($pedido['etiqueta_estado']); ?></h2>
         <span class="badge bg-dark text-white p-2">Proceso: <?php echo strtoupper(str_replace('_',' ',$pedido['nombre_proceso'])); ?></span>
     </div>
 
@@ -182,7 +197,7 @@ $items = $pdo->query("SELECT pi.*, im.nombre FROM pedidos_items pi JOIN insumos_
                                     <td><?php echo htmlspecialchars($i['nombre']); ?></td>
                                     <td class="text-center text-muted"><?php echo $i['cantidad_solicitada']; ?></td>
                                     <td>
-                                        <?php if($puede_gestionar && !$es_fin_adquisicion): ?>
+                                        <?php if($puede_gestionar && !$es_fin_adquisicion && $pedido['id_rol_responsable'] != 0): ?>
                                             <input type="number" name="cant_aprobada[<?php echo $i['id']; ?>]" class="form-control text-center fw-bold text-primary" value="<?php echo ($i['cantidad_aprobada'] ?? $i['cantidad_solicitada']); ?>">
                                         <?php else: ?>
                                             <span class="fw-bold"><?php echo ($i['cantidad_aprobada'] ?? $i['cantidad_solicitada']); ?></span>
@@ -205,7 +220,7 @@ $items = $pdo->query("SELECT pi.*, im.nombre FROM pedidos_items pi JOIN insumos_
                             <?php if ($es_fin_adquisicion): ?>
                                 <div class="alert alert-warning text-start small">
                                     <i class="fas fa-file-invoice-dollar"></i> <strong>Paso Final (Compras):</strong><br>
-                                    Debe adjuntar la Orden de Compra generada para finalizar el proceso y notificar a los involucrados.
+                                    Debe adjuntar la Orden de Compra generada para finalizar.
                                 </div>
                                 <div class="mb-3 text-start">
                                     <label class="form-label fw-bold">Adjuntar Orden de Compra (PDF/Img)</label>
@@ -213,6 +228,11 @@ $items = $pdo->query("SELECT pi.*, im.nombre FROM pedidos_items pi JOIN insumos_
                                 </div>
                                 <button type="submit" class="btn btn-success btn-lg w-100 fw-bold py-3">
                                     <i class="fas fa-check-double me-2"></i> FINALIZAR Y NOTIFICAR
+                                </button>
+
+                            <?php elseif(strpos($pedido['nombre_estado'], 'confirmacion') !== false): ?>
+                                <button type="submit" class="btn btn-success btn-lg w-100 fw-bold py-3">
+                                    <i class="fas fa-handshake me-2"></i> CONFIRMAR RECEPCIÓN
                                 </button>
 
                             <?php elseif($pedido['nombre_proceso'] == 'movimiento_insumos' && $pedido['nombre_estado'] == 'preparacion_retiro'): ?>
